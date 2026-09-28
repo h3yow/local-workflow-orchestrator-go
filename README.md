@@ -14,7 +14,7 @@ Only the Go standard library is used (`go 1.25`).
 | `pkg/spec` | Declarative specification, validation (cycles / dangling deps / duplicate ids / illegal values) with distinguishable reject codes, and the canonical topological order |
 | `pkg/backoff` | Retry backoff policies (`none`, `fixed`, `linear`, `exponential`, capped) |
 | `pkg/model` | Run/node states, failure/skip codes, attempt records, transition events, deep-copy snapshots for concurrent readers |
-| `pkg/store` | Durability boundary: `MemoryStore` (tests) and `FileStore` (atomic JSON snapshots + append-only JSONL event log) |
+| `pkg/store` | Durability boundary: `MemoryStore` (tests) and `FileStore` (atomic JSON snapshots + append-only JSONL event and business-action logs) |
 | `pkg/engine` | Single-writer scheduler: bounded dispatch, FIFO admission, retries/timeouts, skip propagation, dynamic spawn validation, recovery and observers |
 
 ## Quick start
@@ -62,11 +62,31 @@ rec, _ := eng2.Wait(context.Background(), runID)
   failed nodes make all transitive dependents `skipped` (distinct from both
   `failed` and unexecuted `pending`), annotated with `upstream_failed` and the
   blocking node id.
+- **Terminal classification**: `succeeded` / `failed` / `skipped` are mutually
+  exclusive. Entering a terminal state writes the reason atomically with the
+  state and clears leftovers — a node that was interrupted and replayed ends
+  with a bare success (no `recovered_running` code or message), a failed node
+  never carries a skip hint, and a parked retry deadline is always cleared.
+  Intermediate recovery/retry information stays observable in history but
+  never changes the final classification; history replay and concurrent
+  readers derive the same state/reason pair.
+- **Business actions (exactly-once per run)**: tasks register externally
+  visible effects through `in.Actions.Commit(ctx, businessKey, payload)`.
+  Within a `(run, node)` the key takes effect exactly once: the first durable
+  commit returns `committed=true` (the signal to perform the effect); retries,
+  crash-recovered replays and racing goroutines get the original record with
+  `committed=false`. The committed set survives restarts, is queryable via
+  `eng.Actions(runID)` / `RunRecord.Actions`, replays in deterministic order,
+  and never interacts across runs.
 - **Failure codes**: `attempts_exhausted`, `timeout`, `permanent`,
-  `invalid_spawn`, `upstream_failed`, `recovered_running`.
+  `invalid_spawn`, `upstream_failed`, `recovered_running` (the last one is an
+  intermediate annotation only and never appears on a terminal node).
 - **Retries**: each failing attempt is retried up to `MaxAttempts-1` times
   using the node's deterministic backoff policy; `engine.Permanent(err)`
-  short-circuits retries; a timeout counts as a failed attempt.
+  short-circuits retries; a timeout counts as a failed attempt. The retry
+  deadline is an **absolute timestamp persisted with the `ready` state**, so a
+  restart during the wait resumes with the remaining time — never an immediate
+  retry and never a fresh wait; repeated restarts keep the original deadline.
 - **Concurrency & determinism**: one scheduler goroutine per run owns all
   bookkeeping; dispatch follows the canonical (lexicographically smallest)
   topological order with strict FIFO admission, so no ready node can be
@@ -81,14 +101,24 @@ rec, _ := eng2.Wait(context.Background(), runID)
 - **Recovery**: every transition immediately persists an atomic snapshot;
   transition events are flushed at barriers with strictly increasing,
   idempotent sequence numbers. On restart, `succeeded` nodes are never re-run;
-  a node found `running/queued/ready` is reset to `pending`, annotated with
+  a node found `running/queued` is reset to `pending`, annotated with
   `recovered_running`, and its attempt is replayed — it is never silently
-  marked successful, and replayed events cannot duplicate history records.
+  marked successful, and replayed events cannot duplicate history records. A
+  node found mid-backoff keeps its absolute retry deadline (see above).
 - **Dynamic expansion**: a successful task may return `SpawnNode`s. The
   expanded graph is fully re-validated (ids, values, dangling edges, cycles);
   any structural problem rejects the **whole batch** and fails the producing
   node with `invalid_spawn`. A duplicate id (in the batch or the graph) takes
   effect exactly once.
+
+### Compatibility
+
+Snapshots gained the optional `NodeStatus.RetryReadyAt` field (an absolute
+time, nil for older/intermediate snapshots); action logs live in a separate
+`actions/` directory. Older snapshots without the field recover exactly as
+before (a parked `ready` node is replayed immediately). The `Store` interface
+gained `CommitAction`/`LoadActions`; custom implementations must provide both
+(the engine requires them).
 
 See [`docs/design.md`](docs/design.md) for full semantics, recovery rules,
 storage layout and verification procedure.

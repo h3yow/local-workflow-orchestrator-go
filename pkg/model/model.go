@@ -58,6 +58,12 @@ type NodeStatus struct {
 	FinishedAt     time.Time
 	Spawned        []string
 	Attempts       []AttemptRecord
+	// RetryReadyAt is the absolute wall-clock time at which a node parked in
+	// StateReady becomes eligible for its next attempt. It is persisted so a
+	// restart during the backoff wait resumes with the REMAINING wait instead
+	// of retrying immediately or starting a fresh wait. It is nil unless the
+	// node is currently parked waiting for a retry.
+	RetryReadyAt *time.Time
 }
 
 // Clone returns a deep copy.
@@ -71,6 +77,10 @@ func (n *NodeStatus) Clone() *NodeStatus {
 	}
 	if n.Attempts != nil {
 		cp.Attempts = append([]AttemptRecord(nil), n.Attempts...)
+	}
+	if n.RetryReadyAt != nil {
+		t := *n.RetryReadyAt
+		cp.RetryReadyAt = &t
 	}
 	return &cp
 }
@@ -148,7 +158,67 @@ func (h *History) Clone() *History {
 type RunRecord struct {
 	Status  *RunStatus
 	History *History
+	Actions *ActionLog
 	Spec    *spec.Spec
+}
+
+// ActionRecord is the durable, deduped record of one business side effect.
+// Within a run the pair (NodeID, Key) is unique: the first successful commit
+// wins and every later commit with the same key returns Committed=false
+// without inserting another record. Records survive process restarts and are
+// replayable; they never interact across runs (the run id is part of the
+// storage namespace).
+type ActionRecord struct {
+	// Seq is the run-scoped, strictly increasing commit order (assigned by the
+	// store atomically with the insert).
+	Seq int64
+	// RunID scopes the deduplication domain.
+	RunID string
+	// NodeID identifies the node whose execution committed the action.
+	NodeID string
+	// Key is the stable business identifier of the action (e.g. order id).
+	Key string
+	// Attempt is the 0-based attempt on which the action first took effect.
+	Attempt int
+	// Value is an optional, business-defined replay payload.
+	Value string
+	// CommittedAt is when the unique record was durably stored.
+	CommittedAt time.Time
+}
+
+// Clone returns a deep copy.
+func (a *ActionRecord) Clone() *ActionRecord {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	return &cp
+}
+
+// ActionLog is the replayable set of a run's committed business actions.
+type ActionLog struct {
+	RunID   string
+	Actions []ActionRecord
+}
+
+// Clone returns a deep copy.
+func (l *ActionLog) Clone() *ActionLog {
+	if l == nil {
+		return nil
+	}
+	cp := *l
+	cp.Actions = append([]ActionRecord(nil), l.Actions...)
+	return &cp
+}
+
+// Lookup returns the record committed with key and true, or nil/false.
+func (l *ActionLog) Lookup(key string) (*ActionRecord, bool) {
+	for i := range l.Actions {
+		if l.Actions[i].Key == key {
+			return &l.Actions[i], true
+		}
+	}
+	return nil, false
 }
 
 // cloneSpec deep-copies a spec (the spec package owns validation; mirroring

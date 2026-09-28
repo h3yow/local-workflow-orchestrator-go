@@ -79,6 +79,69 @@ Failure codes (`model.FailureCode`):
 A run is `succeeded` iff every node is `succeeded`; presence of any
 `failed`/`skipped` node makes the run `failed`.
 
+### 2.1 Terminal classification is clean and mutually exclusive
+
+The three terminal states are strict alternatives; exactly one holds for any
+terminal node, and a node's terminal fields are written atomically with the
+state transition:
+
+- entering **succeeded** clears `FailCode` (to `""`), `FailMessage`,
+  `SkippedBecause` and `RetryReadyAt`. A node that was interrupted mid-attempt
+  and carried the observable `recovered_running` intermediate annotation ends
+  with a bare, clean success — the annotation is retained in *history* but is
+  absent from the terminal status;
+- entering **failed** sets `FailCode`/`FailMessage` to the terminal reason and
+  clears skip hints and parked deadlines;
+- entering **skipped** sets `code=upstream_failed`, the explanatory message and
+  `SkippedBecause`, and clears failure/backoff leftovers.
+
+Non-terminal transitions (parked `ready`, recovery repairs) keep their
+intermediate markers on purpose: they remain observable while the run is
+incomplete, but the final classification is decided solely by the terminal
+transition. Because terminal fields are persisted inside the same atomic
+snapshot write as the state change, concurrent readers always observe a
+self-consistent state/reason pair, and replaying history (whose last event per
+node is the terminal transition) reproduces the identical classification.
+
+### 2.2 Business actions: run-scoped exactly-once records
+
+Tasks with external side effects (placing an order, sending a message,
+writing a result file) register them through the recorder handed in
+`TaskInput.Actions`:
+
+```go
+rec, committed, err := in.Actions.Commit(ctx, "order-42", replayPayload)
+if err != nil { return nil, err }
+if committed {
+    // exactly one caller across attempts and crashes performs the effect
+}
+```
+
+Rules:
+
+- **dedup scope**: the business key is unique per `(run, node)`. The first
+  durable commit wins; retries, recovered replays, and racing goroutines
+  committing the same key all receive the original record with
+  `committed=false` and perform nothing. Different runs never interfere, even
+  with identical keys; different nodes within one run also have separate key
+  spaces;
+- **crash window**: `Commit` is durable before returning. A process killed
+  after the commit but while the node is still `running` finds the record on
+  resume; the replayed attempt sees `committed=false`, so the final action set
+  contains exactly one record and the effect is not counted twice. A crash
+  *during* an uncommitted external call follows the usual replay semantics —
+  gate the effect on `committed` (or make the business call itself idempotent
+  with the same key);
+- **query and replay**: `Engine.Actions(runID)` and
+  `RunRecord.Actions` return the committed set in deterministic commit order
+  (`Seq` ascending); the view is identical before and after restart and under
+  concurrent readers. The winning record's `Attempt`, `Value` and
+  `CommittedAt` are preserved; losing commits mutate nothing.
+
+Storage is a per-run append-only action log (`actions/<runID>.log` in
+`FileStore`) scanned on open to rebuild the committed key set and sequence
+counter; the check, sequence assignment and append are one atomic operation.
+
 ## 3. Scheduling and concurrency
 
 ### 3.1 Single-writer loop
@@ -127,6 +190,30 @@ ready-nodes are impossible by construction.
   `exponential Base*Factor^attempt`, all optionally capped by `MaxDelay`.
   Policies have no randomness — delays are reproducible.
 
+#### 3.3.1 Backoff waits survive restarts
+
+When a failed attempt is scheduled for retry, the scheduler computes the
+**absolute** retry deadline `now + Delay(attempt)` and writes it into the node
+snapshot (`NodeStatus.RetryReadyAt`) in the same durable transition that moves
+the node to `ready`. On `Resume`:
+
+- a `ready` node carrying `RetryReadyAt` stays `ready`; the in-memory timer is
+  re-armed with the *same* absolute deadline, so the process sleeps only for
+  the **remaining** wait — it does not retry immediately and does not start a
+  fresh (therefore longer) wait;
+- if the deadline is already in the past at restart, the node is eligible
+  immediately;
+- the deadline is anchored to the original failure, so any number of restarts
+  within the wait keep the final retry instant identical to the uninterrupted
+  policy; a history event records each preserved deadline
+  (`"resumed inside backoff wait; retry deadline … preserved"`) without
+  changing the node state;
+- starting an attempt clears `RetryReadyAt`; every terminal state clears it as
+  well, so a finished node never looks parked.
+
+Intermediate information (the parked wait, retry events) stays observable in
+history; it never alters terminal classification (see §2.1).
+
 ### 3.4 Backpressure
 
 Two bounds apply:
@@ -152,6 +239,7 @@ Two bounds apply:
 <dir>/
   runs/<runID>.json      # full snapshot, written temp-file + fsync + rename
   events/<runID>.log     # append-only JSON Lines, one SnapshotEvent per line
+  actions/<runID>.log    # append-only JSON Lines, one deduped ActionRecord per line
 ```
 
 - Snapshots are rewritten atomically (rename); readers never see torn state.
@@ -159,6 +247,11 @@ Two bounds apply:
 - `AppendEvent` is idempotent for a `(RunID, Seq)`: on restart the existing
   log is scanned for the max Seq, so a replayed append cannot duplicate a
   history record.
+- `CommitAction` is idempotent for a `(RunID, NodeID, Key)`: on restart the
+  action log is scanned to rebuild the committed key set and max action Seq,
+  so replays cannot duplicate a business action or reuse its sequence.
+  `RetryReadyAt` deadlines live inside the snapshot JSON and therefore need no
+  separate write.
 
 ### 4.2 Write ordering
 
@@ -178,20 +271,27 @@ announce success before the in-memory transition is authoritative.
 expanded `Spec`), rebuilds the `Graph`, and:
 
 - an already terminal run is returned as-is;
-- a node in `running`/`queued`/`ready` is reset to `pending`, annotated with
+- a node in `running`/`queued` is reset to `pending`, annotated with
   `recovered_running` and an explanatory history event
   (`"interrupted while <state>; attempt replayed"`), and its recorded attempt
-  index is preserved;
+  index is preserved; a legacy `ready` snapshot without a durable deadline is
+  repaired the same defensive way;
+- a node in `ready` **with** a persisted `RetryReadyAt` keeps its parked state
+  and the same absolute retry deadline (§3.3.1): only the remaining backoff is
+  waited after restart, repeatedly across multiple restarts;
 - `succeeded` nodes are never re-executed;
 - on resume the max stored event Seq seeds the scheduler counter so new events
   never reuse or duplicate a Seq.
 
 **Side effects**: the engine guarantees *at-most-once dispatch per attempt
 per committed state*, but a task killed mid-execution by definition cannot be
-made effect-free by an orchestrator. Tasks with external side effects should
-therefore be idempotent and may use `TaskInput{RunID, NodeID, Attempt}` as an
-idempotency key; the same `(run, node, attempt)` is replayed at most once
-after a crash.
+made effect-free by an orchestrator alone. Business actions registered with
+`TaskInput.Actions.Commit` get run-scoped **exactly-once records**: the key
+commits once durably, retries/replays after a crash see the existing record,
+and the committed set is queryable and replayable (§2.2). Tasks that prefer
+end-to-end idempotency may additionally use `TaskInput{RunID, NodeID,
+Attempt}` as an idempotency key against their own external system; the same
+`(run, node, attempt)` is replayed at most once after a crash.
 
 ## 5. Dynamic expansion
 
@@ -215,16 +315,20 @@ its downstream rules apply normally.
 ## 6. Multi-run consistency and observers
 
 - Runs are independent state machines over the same store; their status maps,
-  event logs, revision counters and node ids never overlap. A failing run does
-  not mutate another run's snapshot or history (covered by
-  `TestMultiRunIsolation`).
-- `GetRun` returns a deep-cloned `RunRecord` (snapshot + replayed history);
-  concurrent readers never observe a half-updated map (the code passes
-  `-race`).
+  event logs, action logs, revision counters and node ids never overlap. A
+  failing run does not mutate another run's snapshot, history or action set
+  (covered by `TestMultiRunIsolation` and `TestActionScopedPerRun`).
+- `GetRun` returns a deep-cloned `RunRecord` (snapshot + replayed history +
+  committed action set); concurrent readers never observe a half-updated map
+  (the code passes `-race`) and the state/reason pair is always
+  self-consistent (§2.1).
 - `Subscribe` replays durable history then streams live transitions on a
   buffered channel; sequence numbers are strictly increasing per run.
-- Store writes are mutually excluded (per-run event log locks; full-map locks
-  for the memory store) and reads are copy-on-read.
+- Store writes are mutually excluded (per-run event/action log locks; full-map
+  locks for the memory store) and reads are copy-on-read. The same
+  `(run, node, action-key)` therefore has exactly one winner even under
+  concurrent commits (`TestActionConcurrentSameKey`), and action replays are
+  ordered by commit `Seq`.
 
 ## 7. Verification
 
@@ -247,6 +351,9 @@ Test matrix (each test logs the input spec and transition rationale):
 | no starvation / no duplicate, reproducible history | `TestDeterministicRepeatedRuns` |
 | bounded queue, no dropped work | `TestBackpressureBoundedQueue` |
 | interrupted while running: no silent success, no re-run of success, no duplicate records | `TestRecoveryRunningNotMarkedSucceeded` |
-| interrupted while retrying: attempt count preserved | `TestRecoveryMidRetry` |
+| interrupted during a backoff wait: absolute deadline preserved, remaining wait only, survives repeated restarts | `TestRecoveryMidRetry` |
+| business action exactly-once across the crash window, retries and racing commits; per-run scoping; durable replay | `TestActionExactlyOnceAcrossCrash`, `TestActionScopedPerRun`, `TestActionConcurrentSameKey`, `TestActionReplayAcrossReopenedStore` |
+| store-level action log: dedup, sequence continuation, isolation, concurrency | `pkg/store/action_test.go` |
+| clean terminal success after recovery; three terminal classes mutually exclusive; concurrent readers self-consistent; replay classification stable | `TestTerminalSuccessCleanAfterRecovery`, `TestTerminalClassesMutuallyExclusive`, `TestTerminalClassificationConcurrentReaders`, `TestTerminalReplayStableAcrossRuns` |
 | dynamic spawn, dedup-once, cycle/dangling/cap rejection | `pkg/engine/engine_spawn_test.go` |
 | cross-run isolation, concurrent reader consistency | `TestMultiRunIsolation`, `TestObserverConsistentView` |

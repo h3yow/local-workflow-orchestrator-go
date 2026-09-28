@@ -198,8 +198,8 @@ func (e *Engine) Wait(ctx context.Context, runID string) (*model.RunRecord, erro
 	return e.GetRun(ctx, runID)
 }
 
-// GetRun returns a consistent deep-copied view of one run: status snapshot
-// plus the append-only transition history.
+// GetRun returns a consistent deep-copied view of one run: status snapshot,
+// the append-only transition history and the deduped business-action set.
 func (e *Engine) GetRun(ctx context.Context, runID string) (*model.RunRecord, error) {
 	e.mu.RLock()
 	entry := e.runs[runID]
@@ -215,7 +215,18 @@ func (e *Engine) GetRun(ctx context.Context, runID string) (*model.RunRecord, er
 	if err != nil {
 		return nil, err
 	}
-	return &model.RunRecord{Status: status, History: hist}, nil
+	actions, err := e.store.LoadActions(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	return &model.RunRecord{Status: status, History: hist, Actions: actions}, nil
+}
+
+// Actions returns the durable, deduped business-action set of a run in
+// deterministic commit order (Seq ascending). It is safe to call concurrently
+// with execution and after restarts; every observer sees the same set.
+func (e *Engine) Actions(ctx context.Context, runID string) (*model.ActionLog, error) {
+	return e.store.LoadActions(ctx, runID)
 }
 
 // Subscribe streams state transitions; calling the returned func unsubscribes.

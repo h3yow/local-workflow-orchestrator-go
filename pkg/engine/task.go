@@ -33,6 +33,9 @@ type TaskInput struct {
 	RunID   string
 	NodeID  string
 	Attempt int // 0-based attempt number
+	// Actions registers externally-visible business effects with run-scoped
+	// exactly-once dedup; it is always non-nil during engine execution.
+	Actions ActionRecorder
 }
 
 // Task is the executable unit bound to a node id.

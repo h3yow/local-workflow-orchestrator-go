@@ -27,6 +27,13 @@ type FileStore struct {
 	logMu   map[string]*sync.Mutex
 	lastSeq map[string]int64
 	loaded  map[string]bool
+
+	// actionMu serialises per-run action-log appends; action state
+	// (lastActionSeq/keys/actionLoaded) is guarded by mu.
+	actionMu      map[string]*sync.Mutex
+	lastActionSeq map[string]int64
+	actionKeys    map[string]map[string]struct{}
+	actionLoaded  map[string]bool
 }
 
 // NewFileStore opens (creating if needed) a file-backed store in dir.
@@ -37,11 +44,18 @@ func NewFileStore(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "events"), 0o755); err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(filepath.Join(dir, "actions"), 0o755); err != nil {
+		return nil, err
+	}
 	return &FileStore{
-		dir:     dir,
-		logMu:   make(map[string]*sync.Mutex),
-		lastSeq: make(map[string]int64),
-		loaded:  make(map[string]bool),
+		dir:           dir,
+		logMu:         make(map[string]*sync.Mutex),
+		lastSeq:       make(map[string]int64),
+		loaded:        make(map[string]bool),
+		actionMu:      make(map[string]*sync.Mutex),
+		lastActionSeq: make(map[string]int64),
+		actionKeys:    make(map[string]map[string]struct{}),
+		actionLoaded:  make(map[string]bool),
 	}, nil
 }
 
@@ -67,6 +81,9 @@ func (f *FileStore) statusPath(runID string) string {
 }
 func (f *FileStore) eventPath(runID string) string {
 	return filepath.Join(f.dir, "events", runID+".log")
+}
+func (f *FileStore) actionPath(runID string) string {
+	return filepath.Join(f.dir, "actions", runID+".log")
 }
 
 func writeFileAtomic(path string, data []byte) error {
@@ -293,4 +310,189 @@ func (f *FileStore) LoadHistory(ctx context.Context, runID string) (*model.Histo
 		h.Events = append(h.Events, ev)
 	}
 	return h, sc.Err()
+}
+
+// actionLock returns the mutex serialising appends to one run's action log.
+func (f *FileStore) actionLock(runID string) *sync.Mutex {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := f.actionMu[runID]
+	if m == nil {
+		m = &sync.Mutex{}
+		f.actionMu[runID] = m
+	}
+	return m
+}
+
+// ensureActionsLoadedLocked scans an existing action log once after (re)start
+// to learn the committed key set and the highest Seq, so a replay after a
+// crash can neither duplicate a record nor reuse a Seq.
+func (f *FileStore) ensureActionsLoadedLocked(runID string) error {
+	if f.actionLoaded[runID] {
+		return nil
+	}
+	path := f.actionPath(runID)
+	file, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		f.actionLoaded[runID] = true
+		f.lastActionSeq[runID] = 0
+		f.actionKeys[runID] = map[string]struct{}{}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	keys := map[string]struct{}{}
+	maxSeq := int64(0)
+	sc := bufio.NewScanner(file)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec model.ActionRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return fmt.Errorf("corrupt action log for run %q: %w", runID, err)
+		}
+		keys[actionDedupKey(rec.NodeID, rec.Key)] = struct{}{}
+		if rec.Seq > maxSeq {
+			maxSeq = rec.Seq
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	f.actionLoaded[runID] = true
+	f.lastActionSeq[runID] = maxSeq
+	f.actionKeys[runID] = keys
+	return nil
+}
+
+// actionDedupKey namespaces the business key by node within one run.
+func actionDedupKey(nodeID, key string) string {
+	return nodeID + "\x00" + key
+}
+
+func (f *FileStore) CommitAction(ctx context.Context, rec *model.ActionRecord) (*model.ActionRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if err := safeName(rec.RunID); err != nil {
+		return nil, false, err
+	}
+	lock := f.actionLock(rec.RunID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	f.mu.Lock()
+	if err := f.ensureActionsLoadedLocked(rec.RunID); err != nil {
+		f.mu.Unlock()
+		return nil, false, err
+	}
+	dk := actionDedupKey(rec.NodeID, rec.Key)
+	if _, dup := f.actionKeys[rec.RunID][dk]; dup {
+		// Duplicate (retry/replay/recovered attempt): load and return the
+		// original winning record; nothing is appended.
+		f.mu.Unlock()
+		log, err := f.readActionLogLocked(rec.RunID)
+		if err != nil {
+			return nil, false, err
+		}
+		for i := range log.Actions {
+			if actionDedupKey(log.Actions[i].NodeID, log.Actions[i].Key) == dk {
+				stored := log.Actions[i]
+				return &stored, false, nil
+			}
+		}
+		return nil, false, fmt.Errorf("action key %q tracked but record missing", dk)
+	}
+	stored := *rec
+	f.lastActionSeq[rec.RunID]++
+	stored.Seq = f.lastActionSeq[rec.RunID]
+	data, err := json.Marshal(&stored)
+	if err != nil {
+		f.mu.Unlock()
+		return nil, false, err
+	}
+	f.mu.Unlock()
+
+	data = append(data, '\n')
+	fp, err := os.OpenFile(f.actionPath(rec.RunID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := fp.Write(data); err != nil {
+		_ = fp.Close()
+		return nil, false, err
+	}
+	if err := fp.Sync(); err != nil {
+		_ = fp.Close()
+		return nil, false, err
+	}
+	if err := fp.Close(); err != nil {
+		return nil, false, err
+	}
+
+	// Record the claim only after the durable append succeeds, so a crashed
+	// write cannot poison the in-memory key set for the rest of the process.
+	f.mu.Lock()
+	f.actionKeys[rec.RunID][dk] = struct{}{}
+	f.mu.Unlock()
+	return &stored, true, nil
+}
+
+// readActionLogLocked parses the whole action log; ordering is normalised on
+// read so every replay (and every concurrent reader) sees the same set and
+// order regardless of how records arrived on disk.
+func (f *FileStore) readActionLogLocked(runID string) (*model.ActionLog, error) {
+	file, err := os.Open(f.actionPath(runID))
+	if errors.Is(err, fs.ErrNotExist) {
+		return &model.ActionLog{RunID: runID}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	log := &model.ActionLog{RunID: runID}
+	sc := bufio.NewScanner(file)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec model.ActionRecord
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return nil, fmt.Errorf("corrupt action log for run %q: %w", runID, err)
+		}
+		log.Actions = append(log.Actions, rec)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(log.Actions, func(i, j int) bool { return log.Actions[i].Seq < log.Actions[j].Seq })
+	return log, nil
+}
+
+func (f *FileStore) LoadActions(ctx context.Context, runID string) (*model.ActionLog, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := safeName(runID); err != nil {
+		return nil, err
+	}
+	// A run may legitimately have an empty action log; a missing status file
+	// means the run id itself is unknown.
+	if _, err := os.Stat(f.statusPath(runID)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, model.ErrNotFound
+		}
+		return nil, err
+	}
+	lock := f.actionLock(runID)
+	lock.Lock()
+	defer lock.Unlock()
+	return f.readActionLogLocked(runID)
 }

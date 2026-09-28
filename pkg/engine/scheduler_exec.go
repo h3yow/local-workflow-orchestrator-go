@@ -73,6 +73,7 @@ func (sc *scheduler) startAttempt(ctx context.Context, id string) {
 	attempt := ns.Attempt - 1
 	sc.inflight[id] = true
 	delete(sc.readyAt, id)
+	ns.RetryReadyAt = nil // a started attempt is no longer parked in a wait
 	sc.mu.Unlock()
 
 	_ = sc.transition(ctx, id, model.StateRunning, model.FailNone, "attempt started")
@@ -84,7 +85,18 @@ func (sc *scheduler) startAttempt(ctx context.Context, id string) {
 	go func() {
 		defer cancel()
 		start := sc.engine.clock.Now()
-		res, err := task(attemptCtx, TaskInput{RunID: sc.entry.id, NodeID: id, Attempt: attempt})
+		input := TaskInput{
+			RunID:   sc.entry.id,
+			NodeID:  id,
+			Attempt: attempt,
+			Actions: &actionRecorder{
+				engine:  sc.engine,
+				runID:   sc.entry.id,
+				nodeID:  id,
+				attempt: attempt,
+			},
+		}
+		res, err := task(attemptCtx, input)
 		finish := sc.engine.clock.Now()
 		timedOut := attemptCtx.Err() == context.DeadlineExceeded
 		if err == nil && timedOut {
@@ -162,12 +174,18 @@ func (sc *scheduler) finishAttempt(ctx context.Context, r attemptResult) {
 		_ = sc.transition(ctx, r.nodeID, model.StateSucceeded, model.FailNone, "attempt succeeded")
 	case sc.shouldRetry(node, r):
 		// Schedule another attempt with the configured deterministic backoff.
+		// The absolute deadline is written into the loop's in-memory timer map
+		// and, in the SAME durable transition, into the node snapshot
+		// (RetryReadyAt), so a restart during the wait resumes with the
+		// remaining time instead of restarting the wait or firing immediately.
 		delay := node.Backoff.Delay(r.attempt)
+		deadline := sc.engine.clock.Now().Add(delay)
 		sc.mu.Lock()
-		sc.readyAt[r.nodeID] = sc.engine.clock.Now().Add(delay)
+		sc.readyAt[r.nodeID] = deadline
 		sc.mu.Unlock()
-		_ = sc.transition(ctx, r.nodeID, model.StateReady, model.FailNone,
-			"attempt "+itoa(r.attempt+1)+" failed; retry scheduled after "+delay.String()+": "+r.err.Error())
+		_ = sc.transitionWith(ctx, r.nodeID, model.StateReady, model.FailNone,
+			"attempt "+itoa(r.attempt+1)+" failed; retry scheduled after "+delay.String()+": "+r.err.Error(),
+			func(ns *model.NodeStatus) { ns.RetryReadyAt = &deadline })
 	default:
 		code := model.FailAttemptsExhausted
 		if r.timedOut {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	"github.com/h3yow/local-workflow-orchestrator-go/pkg/model"
@@ -10,17 +11,21 @@ import (
 // MemoryStore is an in-memory Store useful for tests. All reads return deep
 // copies so concurrent observers never see partially updated state.
 type MemoryStore struct {
-	mu      sync.RWMutex
-	status  map[string]*model.RunStatus
-	order   []string
-	history map[string]*model.History
+	mu        sync.RWMutex
+	status    map[string]*model.RunStatus
+	order     []string
+	history   map[string]*model.History
+	actions   map[string]*model.ActionLog
+	actionSeq map[string]int64
 }
 
 // NewMemoryStore constructs an empty MemoryStore.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		status:  make(map[string]*model.RunStatus),
-		history: make(map[string]*model.History),
+		status:    make(map[string]*model.RunStatus),
+		history:   make(map[string]*model.History),
+		actions:   make(map[string]*model.ActionLog),
+		actionSeq: make(map[string]int64),
 	}
 }
 
@@ -95,4 +100,54 @@ func (m *MemoryStore) LoadHistory(ctx context.Context, runID string) (*model.His
 		return nil, model.ErrNotFound
 	}
 	return h.Clone(), nil
+}
+
+func (m *MemoryStore) CommitAction(ctx context.Context, rec *model.ActionRecord) (*model.ActionRecord, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	log := m.actions[rec.RunID]
+	if log == nil {
+		log = &model.ActionLog{RunID: rec.RunID}
+		m.actions[rec.RunID] = log
+	}
+	// First writer for (NodeID, Key) wins; later commits return the stored
+	// record unchanged so the side effect is counted exactly once.
+	for i := range log.Actions {
+		if log.Actions[i].NodeID == rec.NodeID && log.Actions[i].Key == rec.Key {
+			stored := log.Actions[i]
+			return &stored, false, nil
+		}
+	}
+	stored := *rec
+	m.actionSeq[rec.RunID]++
+	stored.Seq = m.actionSeq[rec.RunID]
+	log.Actions = append(log.Actions, stored)
+	return &stored, true, nil
+}
+
+func (m *MemoryStore) LoadActions(ctx context.Context, runID string) (*model.ActionLog, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	log, ok := m.actions[runID]
+	if !ok {
+		if _, exists := m.status[runID]; exists {
+			return &model.ActionLog{RunID: runID}, nil
+		}
+		return nil, model.ErrNotFound
+	}
+	out := log.Clone()
+	sortActions(out.Actions)
+	return out, nil
+}
+
+// sortActions orders records by commit Seq (the only order records are ever
+// appended in; sorting makes the guarantee explicit and reproducible).
+func sortActions(as []model.ActionRecord) {
+	sort.Slice(as, func(i, j int) bool { return as[i].Seq < as[j].Seq })
 }
