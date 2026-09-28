@@ -154,7 +154,7 @@ func TestRecoveryMidRetry(t *testing.T) {
 	dir := t.TempDir()
 	st, _ := store.NewFileStore(dir)
 	s := runSpec(
-		spec.NodeSpec{ID: "a", MaxAttempts: 2, Backoff: backoff.Policy{Kind: backoff.KindFixed, Base: 2 * time.Second}},
+		spec.NodeSpec{ID: "a", MaxAttempts: 2, Backoff: backoff.Policy{Kind: backoff.KindFixed, Base: 100 * time.Millisecond}},
 		nn("b", 1, "a"),
 	)
 	logSpec(t, "[RECOV2]", s)

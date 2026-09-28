@@ -13,9 +13,9 @@ Only the Go standard library is used (`go 1.25`).
 |---|---|
 | `pkg/spec` | Declarative specification, validation (cycles / dangling deps / duplicate ids / illegal values) with distinguishable reject codes, and the canonical topological order |
 | `pkg/backoff` | Retry backoff policies (`none`, `fixed`, `linear`, `exponential`, capped) |
-| `pkg/model` | Run/node states, failure/skip codes, attempt records, transition events, deep-copy snapshots for concurrent readers |
-| `pkg/store` | Durability boundary: `MemoryStore` (tests) and `FileStore` (atomic JSON snapshots + append-only JSONL event log) |
-| `pkg/engine` | Single-writer scheduler: bounded dispatch, FIFO admission, retries/timeouts, skip propagation, dynamic spawn validation, recovery and observers |
+| `pkg/model` | Run/node states, failure/skip codes, attempt records, transition events, business-action records, terminal classification, deep-copy snapshots for concurrent readers |
+| `pkg/store` | Durability boundary: `MemoryStore` (tests) and `FileStore` (atomic JSON snapshots + append-only JSONL event and action logs) |
+| `pkg/engine` | Single-writer scheduler: bounded dispatch, FIFO admission, retries/timeouts with restart-resumable waits, at-most-once business actions, skip propagation, dynamic spawn validation, recovery and observers |
 
 ## Quick start
 
@@ -56,6 +56,20 @@ if err := eng2.Resume(context.Background(), runID); err != nil { ... }
 rec, _ := eng2.Wait(context.Background(), runID)
 ```
 
+Register an externally-visible action so it survives retries and crashes
+exactly once within the run:
+
+```go
+orderTask := func(ctx context.Context, in engine.TaskInput) (*engine.ExecResult, error) {
+    inserted, err := in.Actions.Record(ctx, "order-1234", `{"amount":10}`)
+    if err != nil { return nil, err }
+    if inserted { // only the first committer performs the side effect
+        if err := placeOrder(ctx); err != nil { return nil, err }
+    }
+    return &engine.ExecResult{Value: "placed"}, nil
+}
+```
+
 ## Semantics summary
 
 - **Node states**: `pending → queued → running → succeeded | failed`;
@@ -66,7 +80,22 @@ rec, _ := eng2.Wait(context.Background(), runID)
   `invalid_spawn`, `upstream_failed`, `recovered_running`.
 - **Retries**: each failing attempt is retried up to `MaxAttempts-1` times
   using the node's deterministic backoff policy; `engine.Permanent(err)`
-  short-circuits retries; a timeout counts as a failed attempt.
+  short-circuits retries; a timeout counts as a failed attempt. The absolute
+  retry deadline (`RetryNotBefore`) is persisted, so a restart during the wait
+  resumes only the **remaining** delay — never immediately, never a fresh full
+  backoff; repeated restarts converge on the same retry instant.
+- **Business actions**: tasks register external side effects via
+  `in.Actions.Record(ctx, businessKey, payload)`; within a run a key takes
+  effect **at most once** across retries, crashes (record is fsynced before the
+  effect) and concurrent attempts — the first committer performs the effect,
+  duplicates get `inserted=false`. Keys are run-scoped; the committed set is
+  queryable (`engine.ListActions`, `RunRecord.Actions`) and identical for all
+  readers and across restarts.
+- **Terminal classification**: `succeeded` / `failed` / `skipped` are mutually
+  exclusive with clean markers (a success carries no failure/recovery/skip
+  marks). Recovery and retry evidence remains observable in `Attempts` and
+  history; `model.ClassifyTerminal(history)` reproduces the live snapshot's
+  classification, including under concurrent reads.
 - **Concurrency & determinism**: one scheduler goroutine per run owns all
   bookkeeping; dispatch follows the canonical (lexicographically smallest)
   topological order with strict FIFO admission, so no ready node can be
@@ -81,9 +110,10 @@ rec, _ := eng2.Wait(context.Background(), runID)
 - **Recovery**: every transition immediately persists an atomic snapshot;
   transition events are flushed at barriers with strictly increasing,
   idempotent sequence numbers. On restart, `succeeded` nodes are never re-run;
-  a node found `running/queued/ready` is reset to `pending`, annotated with
+  a node found `running/queued` is reset to `pending`, annotated with
   `recovered_running`, and its attempt is replayed — it is never silently
-  marked successful, and replayed events cannot duplicate history records.
+  marked successful, and replayed events cannot duplicate history records. A
+  node found in `ready` keeps its parked retry deadline (see above).
 - **Dynamic expansion**: a successful task may return `SpawnNode`s. The
   expanded graph is fully re-validated (ids, values, dangling edges, cycles);
   any structural problem rejects the **whole batch** and fails the producing

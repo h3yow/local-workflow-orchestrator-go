@@ -58,7 +58,11 @@ func (sc *scheduler) record(ctx context.Context) (*model.RunRecord, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &model.RunRecord{Status: status, History: hist, Spec: sc.graph.Spec()}, nil
+	actions, err := sc.engine.store.LoadActions(ctx, sc.entry.id)
+	if err != nil {
+		return nil, err
+	}
+	return &model.RunRecord{Status: status, History: hist, Spec: sc.graph.Spec(), Actions: actions}, nil
 }
 
 // pendingEvent is a state transition collected during one tick; its Seq is
@@ -85,11 +89,31 @@ func (sc *scheduler) transition(ctx context.Context, nodeID string, to model.Nod
 	from := node.State
 	attempt := node.Attempt
 	node.State = to
-	switch code {
-	case model.FailNone:
-	default:
+	// Terminal classification is strictly mutually exclusive and clean: a
+	// success carries no failure or recovery markers, and failure/skip never
+	// borrow each other's reason. Intermediate attempts (running/queued/ready/
+	// pending repair) retain annotations for observability; those annotations
+	// live on in the transition history regardless of the final outcome.
+	switch to {
+	case model.StateSucceeded:
+		node.FailCode = model.FailNone
+		node.FailMessage = ""
+		node.SkippedBecause = ""
+		node.RetryNotBefore = time.Time{}
+	case model.StateFailed:
 		node.FailCode = code
 		node.FailMessage = detail
+		node.SkippedBecause = ""
+		node.RetryNotBefore = time.Time{}
+	case model.StateSkipped:
+		node.FailCode = code
+		node.FailMessage = detail
+		node.RetryNotBefore = time.Time{}
+	default:
+		if code != model.FailNone {
+			node.FailCode = code
+			node.FailMessage = detail
+		}
 	}
 	if to == model.StateRunning {
 		if node.StartedAt.IsZero() {
@@ -131,9 +155,12 @@ func (sc *scheduler) setRunState(ctx context.Context, st model.NodeState) error 
 }
 
 // recover inspects the persisted snapshot and returns true if the run is
-// already terminal. Non-terminal state is repaired: running/queued/ready
-// nodes fall back to pending and their attempt is replayed (never marked
-// successful); retrying nodes become immediately eligible again.
+// already terminal. Non-terminal state is repaired: running/queued nodes fall
+// back to pending and their attempt is replayed (never marked successful).
+// A node parked in "ready" (retry wait) keeps its state: the persisted
+// RetryNotBefore deadline is restored, so after a restart the engine waits
+// only for the *remaining* backoff — never immediately, never the full delay
+// again. Multiple restarts converge on the same original retry instant.
 func (sc *scheduler) recover(ctx context.Context) (bool, error) {
 	// Highest recorded event seq becomes our counter base so post-recovery
 	// events never reuse a Seq.
@@ -152,13 +179,22 @@ func (sc *scheduler) recover(ctx context.Context) (bool, error) {
 	if !alreadyTerminal {
 		for _, id := range sc.status.NodeOrder {
 			n := sc.status.Nodes[id]
-			if n.State == model.StateRunning || n.State == model.StateQueued || n.State == model.StateReady {
+			switch n.State {
+			case model.StateReady:
+				// Resume the parked wait: keep the original absolute deadline
+				// when it is known; a deadline already in the past makes the
+				// node immediately eligible (the remaining wait is zero).
+				if !n.RetryNotBefore.IsZero() {
+					sc.readyAt[id] = n.RetryNotBefore
+				}
+			case model.StateRunning, model.StateQueued:
 				repaired = append(repaired, pendingEvent{
 					nodeID: id, from: n.State, to: model.StatePending,
 					attempt: n.Attempt, code: model.FailRecoveredRunning,
 					detail: "interrupted while " + string(n.State) + "; attempt replayed",
 				})
 				n.State = model.StatePending
+				n.RetryNotBefore = time.Time{}
 				n.FailCode = model.FailRecoveredRunning
 				n.FailMessage = "interrupted while non-terminal; attempt replayed"
 				changed = true

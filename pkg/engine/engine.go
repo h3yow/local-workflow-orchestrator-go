@@ -215,7 +215,17 @@ func (e *Engine) GetRun(ctx context.Context, runID string) (*model.RunRecord, er
 	if err != nil {
 		return nil, err
 	}
-	return &model.RunRecord{Status: status, History: hist}, nil
+	actions, err := e.store.LoadActions(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	return &model.RunRecord{Status: status, History: hist, Actions: actions}, nil
+}
+
+// ListActions returns the committed business-action records of a run ordered
+// by key. The set is identical for concurrent readers and across restarts.
+func (e *Engine) ListActions(ctx context.Context, runID string) ([]model.ActionRecord, error) {
+	return e.store.LoadActions(ctx, runID)
 }
 
 // Subscribe streams state transitions; calling the returned func unsubscribes.

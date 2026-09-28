@@ -73,6 +73,8 @@ func (sc *scheduler) startAttempt(ctx context.Context, id string) {
 	attempt := ns.Attempt - 1
 	sc.inflight[id] = true
 	delete(sc.readyAt, id)
+	// The deadline belongs to the parked wait that is now over.
+	ns.RetryNotBefore = time.Time{}
 	sc.mu.Unlock()
 
 	_ = sc.transition(ctx, id, model.StateRunning, model.FailNone, "attempt started")
@@ -84,7 +86,13 @@ func (sc *scheduler) startAttempt(ctx context.Context, id string) {
 	go func() {
 		defer cancel()
 		start := sc.engine.clock.Now()
-		res, err := task(attemptCtx, TaskInput{RunID: sc.entry.id, NodeID: id, Attempt: attempt})
+		recorder := &actionRecorder{
+			runID: sc.entry.id, nodeID: id, attempt: attempt,
+			clock: sc.engine.clock, store: sc.engine.store,
+		}
+		res, err := task(attemptCtx, TaskInput{
+			RunID: sc.entry.id, NodeID: id, Attempt: attempt, Actions: recorder,
+		})
 		finish := sc.engine.clock.Now()
 		timedOut := attemptCtx.Err() == context.DeadlineExceeded
 		if err == nil && timedOut {
@@ -162,10 +170,19 @@ func (sc *scheduler) finishAttempt(ctx context.Context, r attemptResult) {
 		_ = sc.transition(ctx, r.nodeID, model.StateSucceeded, model.FailNone, "attempt succeeded")
 	case sc.shouldRetry(node, r):
 		// Schedule another attempt with the configured deterministic backoff.
+		// The absolute deadline is persisted (RetryNotBefore) so a restart
+		// during the wait resumes the *remaining* delay instead of retrying
+		// immediately or re-running the full backoff.
 		delay := node.Backoff.Delay(r.attempt)
+		deadline := sc.engine.clock.Now().Add(delay)
 		sc.mu.Lock()
-		sc.readyAt[r.nodeID] = sc.engine.clock.Now().Add(delay)
+		sc.readyAt[r.nodeID] = deadline
+		sc.status.Nodes[r.nodeID].RetryNotBefore = deadline
+		deadlineSnapshot := sc.status.Clone()
 		sc.mu.Unlock()
+		if err := sc.engine.store.SaveStatus(ctx, deadlineSnapshot); err != nil {
+			return
+		}
 		_ = sc.transition(ctx, r.nodeID, model.StateReady, model.FailNone,
 			"attempt "+itoa(r.attempt+1)+" failed; retry scheduled after "+delay.String()+": "+r.err.Error())
 	default:

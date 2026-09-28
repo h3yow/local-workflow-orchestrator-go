@@ -33,6 +33,9 @@ type TaskInput struct {
 	RunID   string
 	NodeID  string
 	Attempt int // 0-based attempt number
+	// Actions durably registers business side effects at most once per
+	// (run, key), across retries, crashes and concurrent attempts.
+	Actions ActionRecorder
 }
 
 // Task is the executable unit bound to a node id.

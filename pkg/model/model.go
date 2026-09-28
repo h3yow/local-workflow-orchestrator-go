@@ -58,6 +58,12 @@ type NodeStatus struct {
 	FinishedAt     time.Time
 	Spawned        []string
 	Attempts       []AttemptRecord
+	// RetryNotBefore is the absolute wall-clock time at which a parked
+	// (retry-waiting) node becomes eligible for its next attempt. It is
+	// persisted with the snapshot so a restart resumes the remaining wait
+	// instead of retrying immediately or restarting the wait from zero. Zero
+	// means no pending retry deadline.
+	RetryNotBefore time.Time
 }
 
 // Clone returns a deep copy.
@@ -149,6 +155,24 @@ type RunRecord struct {
 	Status  *RunStatus
 	History *History
 	Spec    *spec.Spec
+	// Actions are the durable business-action records of the run, ordered by
+	// Key. Concurrent readers and pre/post-restart observers see exactly the
+	// same committed set: records are inserted at most once per (RunID, Key).
+	Actions []ActionRecord
+}
+
+// ActionRecord durably captures one business side effect within a run. A Key
+// is a stable business identifier chosen by the task (e.g. "order-123").
+// Within one run the same Key becomes effective at most once, including across
+// crash/restart windows and concurrent attempts; different runs are fully
+// independent and may reuse the same Key without interfering.
+type ActionRecord struct {
+	RunID    string
+	Key      string
+	Value    string
+	NodeID   string
+	Attempt  int
+	Recorded time.Time
 }
 
 // cloneSpec deep-copies a spec (the spec package owns validation; mirroring
@@ -164,4 +188,31 @@ func cloneSpec(s *spec.Spec) *spec.Spec {
 		cp.Nodes[i] = cn
 	}
 	return &cp
+}
+
+// TerminalClass is the mutually-exclusive terminal classification of a node,
+// derived from the persisted state or replayed from transition history.
+type TerminalClass struct {
+	State NodeState
+	Code  FailureCode
+}
+
+// ClassifyTerminal derives each node's terminal classification from a
+// replayed transition history: it is the last terminal transition (succeeded/
+// failed/skipped) seen for the node. Intermediate transitions such as
+// recovered_running annotations, retry parking and running/queued states are
+// ignored, so a replay classifies nodes exactly as the first run's final
+// snapshot does. Nodes without any terminal transition are absent from the
+// map. Events are assumed to be stored in Seq order.
+func ClassifyTerminal(h *History) map[string]TerminalClass {
+	out := map[string]TerminalClass{}
+	if h == nil {
+		return out
+	}
+	for _, ev := range h.Events {
+		if ev.To.IsTerminal() {
+			out[ev.NodeID] = TerminalClass{State: ev.To, Code: ev.Code}
+		}
+	}
+	return out
 }

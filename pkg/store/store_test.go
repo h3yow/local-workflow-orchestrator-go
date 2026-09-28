@@ -130,3 +130,94 @@ func mk(id string, rev int64) *model.RunStatus {
 	s.Nodes = map[string]*model.NodeStatus{"a": {ID: "a", State: model.StatePending}}
 	return s
 }
+
+func TestActionLogAtMostOnce(t *testing.T) {
+	for name, st := range storeCases(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			_ = st.SaveStatus(ctx, mkStatus("act1", 1))
+			rec := func(key string, attempt int) model.ActionRecord {
+				return model.ActionRecord{RunID: "act1", Key: key, NodeID: "n",
+					Attempt: attempt, Recorded: time.Unix(int64(attempt), 0)}
+			}
+			ins, err := st.AppendAction(ctx, rec("k1", 0))
+			if err != nil || !ins {
+				t.Fatalf("first append inserted=%v err=%v", ins, err)
+			}
+			// Replay of the same key from a retried attempt must not win.
+			ins, err = st.AppendAction(ctx, rec("k1", 1))
+			if err != nil || ins {
+				t.Fatalf("duplicate append inserted=%v err=%v", ins, err)
+			}
+			ins, _ = st.AppendAction(ctx, rec("k2", 0))
+			if !ins {
+				t.Fatal("different key must insert")
+			}
+			got, err := st.LoadActions(ctx, "act1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 2 || got[0].Key != "k1" || got[1].Key != "k2" {
+				t.Fatalf("actions=%v, want k1,k2 ordered by key", got)
+			}
+			// The first committer's payload wins, never the replay's.
+			if got[0].Attempt != 0 {
+				t.Fatalf("first-writer-wins violated: %+v", got[0])
+			}
+			if _, err := st.LoadActions(ctx, "missing"); err != model.ErrNotFound {
+				t.Fatalf("missing run: want ErrNotFound, got %v", err)
+			}
+		})
+	}
+}
+
+func TestActionLogSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	st, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveStatus(ctx, mkStatus("act2", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendAction(ctx, model.ActionRecord{RunID: "act2", Key: "persisted"}); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen with a brand-new FileStore (new process): committed keys must be
+	// remembered and re-append suppressed.
+	reopened, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, err := reopened.AppendAction(ctx, model.ActionRecord{RunID: "act2", Key: "persisted", Attempt: 9})
+	if err != nil || ins {
+		t.Fatalf("replayed action after reopen inserted=%v err=%v", ins, err)
+	}
+	got, err := reopened.LoadActions(ctx, "act2")
+	if err != nil || len(got) != 1 || got[0].Key != "persisted" || got[0].Attempt != 0 {
+		t.Fatalf("reopened actions=%v err=%v", got, err)
+	}
+}
+
+func TestActionKeysScopedPerRun(t *testing.T) {
+	for name, st := range storeCases(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			_ = st.SaveStatus(ctx, mkStatus("run-a", 1))
+			_ = st.SaveStatus(ctx, mkStatus("run-b", 1))
+			for _, run := range []string{"run-a", "run-b"} {
+				ins, err := st.AppendAction(ctx, model.ActionRecord{RunID: run, Key: "same"})
+				if err != nil || !ins {
+					t.Fatalf("%s insert=%v err=%v", run, ins, err)
+				}
+			}
+			for _, run := range []string{"run-a", "run-b"} {
+				got, err := st.LoadActions(ctx, run)
+				if err != nil || len(got) != 1 || got[0].RunID != run {
+					t.Fatalf("%s actions=%v err=%v", run, got, err)
+				}
+			}
+		})
+	}
+}
