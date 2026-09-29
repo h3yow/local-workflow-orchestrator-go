@@ -12,12 +12,14 @@ import (
 //
 // Dedup scope and guarantee:
 //
-//   - the key is unique within (run, node); the same key on later attempts,
-//     after a crash-and-resume replay, or from racing goroutines, takes effect
-//     exactly once;
+//   - the key is unique within the whole run: whether the same key is
+//     committed by two different nodes, by the same node on a later attempt,
+//     after a crash-and-resume replay, or from racing goroutines, it takes
+//     effect exactly once. The first committer performs the side effect;
+//     every later committer receives the already-stored record;
 //
-//   - different runs (and different nodes within a run) never collide, even
-//     when they happen to use the same key string;
+//   - different runs never collide, even when they happen to use the same key
+//     string; within one run, by contrast, every node shares one key space;
 //
 //   - Commit is durable before it returns committed=true, so callers can use
 //     the result as an effect gate:

@@ -356,7 +356,7 @@ func (f *FileStore) ensureActionsLoadedLocked(runID string) error {
 		if err := json.Unmarshal(line, &rec); err != nil {
 			return fmt.Errorf("corrupt action log for run %q: %w", runID, err)
 		}
-		keys[actionDedupKey(rec.NodeID, rec.Key)] = struct{}{}
+		keys[actionDedupKey(rec.Key)] = struct{}{}
 		if rec.Seq > maxSeq {
 			maxSeq = rec.Seq
 		}
@@ -370,9 +370,12 @@ func (f *FileStore) ensureActionsLoadedLocked(runID string) error {
 	return nil
 }
 
-// actionDedupKey namespaces the business key by node within one run.
-func actionDedupKey(nodeID, key string) string {
-	return nodeID + "\x00" + key
+// actionDedupKey is the per-run business identity of an action. Uniqueness is
+// scoped to a run: the same key from a different node, a later attempt, or a
+// crash-recovery replay refers to the same single action. The run id itself is
+// the storage namespace (one log file per run), so runs never collide.
+func actionDedupKey(key string) string {
+	return key
 }
 
 func (f *FileStore) CommitAction(ctx context.Context, rec *model.ActionRecord) (*model.ActionRecord, bool, error) {
@@ -391,17 +394,17 @@ func (f *FileStore) CommitAction(ctx context.Context, rec *model.ActionRecord) (
 		f.mu.Unlock()
 		return nil, false, err
 	}
-	dk := actionDedupKey(rec.NodeID, rec.Key)
+	dk := actionDedupKey(rec.Key)
 	if _, dup := f.actionKeys[rec.RunID][dk]; dup {
-		// Duplicate (retry/replay/recovered attempt): load and return the
-		// original winning record; nothing is appended.
+		// Duplicate (other node / retry / replay / recovered attempt): load
+		// and return the original winning record; nothing is appended.
 		f.mu.Unlock()
 		log, err := f.readActionLogLocked(rec.RunID)
 		if err != nil {
 			return nil, false, err
 		}
 		for i := range log.Actions {
-			if actionDedupKey(log.Actions[i].NodeID, log.Actions[i].Key) == dk {
+			if log.Actions[i].Key == rec.Key {
 				stored := log.Actions[i]
 				return &stored, false, nil
 			}

@@ -163,11 +163,12 @@ type RunRecord struct {
 }
 
 // ActionRecord is the durable, deduped record of one business side effect.
-// Within a run the pair (NodeID, Key) is unique: the first successful commit
-// wins and every later commit with the same key returns Committed=false
-// without inserting another record. Records survive process restarts and are
-// replayable; they never interact across runs (the run id is part of the
-// storage namespace).
+// Within a run Key is unique across ALL nodes: the first successful commit
+// wins — whether later commits come from a different node in the same run, a
+// retry of the same node, or a crash-recovery replay — and every later commit
+// with the same key returns Committed=false without inserting another record.
+// Records survive process restarts and are replayable; they never interact
+// across runs (the run id is part of the storage namespace).
 type ActionRecord struct {
 	// Seq is the run-scoped, strictly increasing commit order (assigned by the
 	// store atomically with the insert).

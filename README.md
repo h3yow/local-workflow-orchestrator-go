@@ -72,12 +72,18 @@ rec, _ := eng2.Wait(context.Background(), runID)
   readers derive the same state/reason pair.
 - **Business actions (exactly-once per run)**: tasks register externally
   visible effects through `in.Actions.Commit(ctx, businessKey, payload)`.
-  Within a `(run, node)` the key takes effect exactly once: the first durable
-  commit returns `committed=true` (the signal to perform the effect); retries,
-  crash-recovered replays and racing goroutines get the original record with
-  `committed=false`. The committed set survives restarts, is queryable via
+  The key takes effect exactly once **within the whole run, regardless of
+  node**: the first durable commit — whether from node A or node B — returns
+  `committed=true` (the signal to perform the effect); every later commit of
+  the same key, including one from a *different* node, a retry, a
+  crash-recovered replay, or a racing goroutine, gets the original record with
+  `committed=false` and inserts no second record. The surviving record keeps
+  the originating node's identity and attempt. The committed set survives
+  restarts (also when recovery re-runs the interrupted node and another node
+  registers the same key after the restart), is queryable via
   `eng.Actions(runID)` / `RunRecord.Actions`, replays in deterministic order,
-  and never interacts across runs.
+  and never interacts across runs (identical keys in different runs are
+  independent).
 - **Failure codes**: `attempts_exhausted`, `timeout`, `permanent`,
   `invalid_spawn`, `upstream_failed`, `recovered_running` (the last one is an
   intermediate annotation only and never appears on a terminal node).
@@ -127,6 +133,14 @@ storage layout and verification procedure.
 
 ```bash
 go test ./... -race -count=3
+```
+
+To verify business-action uniqueness specifically (same key across two nodes,
+concurrent single winner, crash/restart replay):
+
+```bash
+go test ./pkg/store/  -run TestAction -race -count=10
+go test ./pkg/engine/ -run TestAction -race -count=10
 ```
 
 Test logs print the input specification and the state-transition rationale
