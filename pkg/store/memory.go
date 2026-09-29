@@ -113,10 +113,11 @@ func (m *MemoryStore) CommitAction(ctx context.Context, rec *model.ActionRecord)
 		log = &model.ActionLog{RunID: rec.RunID}
 		m.actions[rec.RunID] = log
 	}
-	// First writer for (NodeID, Key) wins; later commits return the stored
-	// record unchanged so the side effect is counted exactly once.
+	// First writer for Key within the run wins (which node or which attempt
+	// registered it is irrelevant); later commits return the stored record
+	// unchanged so the side effect is counted exactly once per run.
 	for i := range log.Actions {
-		if log.Actions[i].NodeID == rec.NodeID && log.Actions[i].Key == rec.Key {
+		if log.Actions[i].Key == rec.Key {
 			stored := log.Actions[i]
 			return &stored, false, nil
 		}

@@ -23,11 +23,13 @@ type Store interface {
 	// LoadHistory replays the transition log of a run.
 	LoadHistory(ctx context.Context, runID string) (*model.History, error)
 	// CommitAction durably records one business side effect. Within a run the
-	// pair (NodeID, Key) is unique: the first call inserts (returns the stored
-	// record and true); later calls with the same key change nothing and return
-	// the existing record and false. The insert, sequence assignment and
-	// dedup check must be one atomic operation so concurrent commits of the
-	// same key can never both report true.
+	// business Key is unique ACROSS ALL NODES: the first call for a key (no
+	// matter which node, attempt or post-restart replay registered it) inserts
+	// and returns the stored record and true; later calls with the same key in
+	// the same run change nothing and return the existing record and false.
+	// Different runs never collide. The insert, sequence assignment and dedup
+	// check must be one atomic operation so concurrent commits of the same key
+	// can never both report true.
 	CommitAction(ctx context.Context, rec *model.ActionRecord) (*model.ActionRecord, bool, error)
 	// LoadActions replays the committed action set of a run in a deterministic
 	// order (Seq ascending), identical before and after a restart and under

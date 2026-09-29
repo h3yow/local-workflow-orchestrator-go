@@ -32,11 +32,24 @@ func TestActionCommitDedupAndReplay(t *testing.T) {
 			if got2.Value != "v1" || got2.Seq != 1 || got2.Attempt != 0 {
 				t.Fatalf("dup changed winner: %+v", got2)
 			}
-			// Same key on a different node is a distinct action.
+			// Same key reused by a DIFFERENT node in the same run is still the
+			// same business action: the run-scoped key, not the node, is the
+			// dedup domain, so the first winner is returned unchanged.
 			got3, committed, err := st.CommitAction(ctx, &model.ActionRecord{
-				RunID: "act1", NodeID: "other", Key: "k1", CommittedAt: time.Now()})
-			if err != nil || !committed || got3.Seq != 2 {
-				t.Fatalf("other-node commit: %+v committed=%v err=%v", got3, committed, err)
+				RunID: "act1", NodeID: "other", Key: "k1",
+				Value: "v-other-node", Attempt: 1, CommittedAt: time.Now()})
+			if err != nil || committed {
+				t.Fatalf("other-node same-key commit: committed=%v err=%v", committed, err)
+			}
+			if got3.Seq != 1 || got3.NodeID != "n" || got3.Value != "v1" || got3.Attempt != 0 {
+				t.Fatalf("other-node same-key changed winner: %+v", got3)
+			}
+			// A genuinely different key (even from that other node) is new and
+			// continues the run-scoped sequence.
+			got4, committed, err := st.CommitAction(ctx, &model.ActionRecord{
+				RunID: "act1", NodeID: "other", Key: "k2", CommittedAt: time.Now()})
+			if err != nil || !committed || got4.Seq != 2 {
+				t.Fatalf("other-node new-key commit: %+v committed=%v err=%v", got4, committed, err)
 			}
 			log, err := st.LoadActions(ctx, "act1")
 			if err != nil {
@@ -44,6 +57,10 @@ func TestActionCommitDedupAndReplay(t *testing.T) {
 			}
 			if len(log.Actions) != 2 {
 				t.Fatalf("records=%d want 2", len(log.Actions))
+			}
+			if log.Actions[0].Key != "k1" || log.Actions[0].NodeID != "n" ||
+				log.Actions[1].Key != "k2" || log.Actions[1].NodeID != "other" {
+				t.Fatalf("unexpected surviving records: %+v", log.Actions)
 			}
 			// Deterministic order across reads.
 			log2, _ := st.LoadActions(ctx, "act1")
@@ -69,6 +86,64 @@ func TestActionCommitDedupAndReplay(t *testing.T) {
 				log3, _ := reopened.LoadActions(ctx, "act1")
 				if len(log3.Actions) != 2 {
 					t.Fatalf("post-restart records=%d want 2", len(log3.Actions))
+				}
+			}
+		})
+	}
+}
+
+// TestActionDedupAcrossNodesSameRun reproduces the cross-node reuse bug:
+// within ONE run the business key alone is the dedup domain, so two different
+// nodes registering the same key must yield exactly one record; the second
+// registrant gets the first winner's record and committed=false and performs
+// no side effect of its own.
+func TestActionDedupAcrossNodesSameRun(t *testing.T) {
+	for name, st := range storeCases(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			if err := st.SaveStatus(ctx, mkStatus("cross", 1)); err != nil {
+				t.Fatal(err)
+			}
+			first, committed, err := st.CommitAction(ctx, &model.ActionRecord{
+				RunID: "cross", NodeID: "node-a", Key: "order-7",
+				Value: "from-a", Attempt: 0, CommittedAt: time.Now()})
+			if err != nil || !committed || first.Seq != 1 {
+				t.Fatalf("first commit: rec=%+v committed=%v err=%v", first, committed, err)
+			}
+			// A different node reuses the same business key in the same run.
+			second, committed, err := st.CommitAction(ctx, &model.ActionRecord{
+				RunID: "cross", NodeID: "node-b", Key: "order-7",
+				Value: "from-b", Attempt: 1, CommittedAt: time.Now()})
+			if err != nil || committed {
+				t.Fatalf("cross-node dup: committed=%v err=%v", committed, err)
+			}
+			if second.Seq != 1 || second.NodeID != "node-a" || second.Value != "from-a" || second.Attempt != 0 {
+				t.Fatalf("loser did not receive the winning record: %+v", second)
+			}
+			log, err := st.LoadActions(ctx, "cross")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(log.Actions) != 1 || log.Actions[0].Key != "order-7" || log.Actions[0].NodeID != "node-a" {
+				t.Fatalf("records=%+v, want exactly the single winner", log.Actions)
+			}
+
+			// File store: reopen (simulated restart) and a third node replaying
+			// the same key after recovery must still see the one winner.
+			if fs, ok := st.(*FileStore); ok {
+				reopened, err := NewFileStore(fs.dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				third, committed, err := reopened.CommitAction(ctx, &model.ActionRecord{
+					RunID: "cross", NodeID: "node-c", Key: "order-7",
+					Value: "from-c", CommittedAt: time.Now()})
+				if err != nil || committed || third.Seq != 1 || third.NodeID != "node-a" {
+					t.Fatalf("post-restart cross-node dup: rec=%+v committed=%v err=%v", third, committed, err)
+				}
+				log2, _ := reopened.LoadActions(ctx, "cross")
+				if len(log2.Actions) != 1 {
+					t.Fatalf("post-restart records=%d want 1", len(log2.Actions))
 				}
 			}
 		})

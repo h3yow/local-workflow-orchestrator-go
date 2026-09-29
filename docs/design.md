@@ -119,19 +119,24 @@ if committed {
 
 Rules:
 
-- **dedup scope**: the business key is unique per `(run, node)`. The first
-  durable commit wins; retries, recovered replays, and racing goroutines
-  committing the same key all receive the original record with
-  `committed=false` and perform nothing. Different runs never interfere, even
-  with identical keys; different nodes within one run also have separate key
-  spaces;
+- **dedup scope**: the business key is unique per **run, across every node in
+  that run**. The first durable commit wins; a *different node* reusing the
+  same key, retries, recovered replays, and racing goroutines committing the
+  same key all receive the original (first-winner) record with
+  `committed=false` and perform/add nothing. Different runs never interfere,
+  even with identical keys — the run id is the only namespace, and the node id
+  is recorded on the winning record but is not part of the dedup domain;
 - **crash window**: `Commit` is durable before returning. A process killed
-  after the commit but while the node is still `running` finds the record on
-  resume; the replayed attempt sees `committed=false`, so the final action set
-  contains exactly one record and the effect is not counted twice. A crash
-  *during* an uncommitted external call follows the usual replay semantics —
-  gate the effect on `committed` (or make the business call itself idempotent
-  with the same key);
+  after the commit but while the registering node is still `running` finds the
+  record on resume; the replayed attempt — or a *different node* that only
+  becomes eligible after recovery and commits the same key — sees
+  `committed=false` and the first winner's record, so the final action set
+  contains exactly one record and the effect is not counted twice. Reopening
+  the store in a fresh process rebuilds the run-scoped key set from disk, so
+  post-restart reads and replays see the same single record in the same order.
+  A crash *during* an uncommitted external call follows the usual replay
+  semantics — gate the effect on `committed` (or make the business call itself
+  idempotent with the same key);
 - **query and replay**: `Engine.Actions(runID)` and
   `RunRecord.Actions` return the committed set in deterministic commit order
   (`Seq` ascending); the view is identical before and after restart and under
@@ -247,9 +252,11 @@ Two bounds apply:
 - `AppendEvent` is idempotent for a `(RunID, Seq)`: on restart the existing
   log is scanned for the max Seq, so a replayed append cannot duplicate a
   history record.
-- `CommitAction` is idempotent for a `(RunID, NodeID, Key)`: on restart the
-  action log is scanned to rebuild the committed key set and max action Seq,
-  so replays cannot duplicate a business action or reuse its sequence.
+- `CommitAction` is idempotent for a `(RunID, Key)`: within one run the
+  business key alone is unique across all nodes and all attempts. On restart
+  the action log is scanned to rebuild the committed key set and max action
+  Seq, so replays (including the same key registered by another node) cannot
+  duplicate a business action or reuse its sequence.
   `RetryReadyAt` deadlines live inside the snapshot JSON and therefore need no
   separate write.
 
@@ -352,8 +359,8 @@ Test matrix (each test logs the input spec and transition rationale):
 | bounded queue, no dropped work | `TestBackpressureBoundedQueue` |
 | interrupted while running: no silent success, no re-run of success, no duplicate records | `TestRecoveryRunningNotMarkedSucceeded` |
 | interrupted during a backoff wait: absolute deadline preserved, remaining wait only, survives repeated restarts | `TestRecoveryMidRetry` |
-| business action exactly-once across the crash window, retries and racing commits; per-run scoping; durable replay | `TestActionExactlyOnceAcrossCrash`, `TestActionScopedPerRun`, `TestActionConcurrentSameKey`, `TestActionReplayAcrossReopenedStore` |
-| store-level action log: dedup, sequence continuation, isolation, concurrency | `pkg/store/action_test.go` |
+| business action exactly-once within a run across different nodes, retries, the crash window and racing commits; per-run scoping; durable replay | `TestActionSameKeyTwoNodesOneEffect`, `TestActionSameKeyAcrossNodesAndRestart`, `TestActionExactlyOnceAcrossCrash`, `TestActionScopedPerRun`, `TestActionConcurrentSameKey`, `TestActionReplayAcrossReopenedStore` |
+| store-level action log: run-scoped (cross-node) dedup, sequence continuation, isolation, concurrency, restart | `pkg/store/action_test.go` |
 | clean terminal success after recovery; three terminal classes mutually exclusive; concurrent readers self-consistent; replay classification stable | `TestTerminalSuccessCleanAfterRecovery`, `TestTerminalClassesMutuallyExclusive`, `TestTerminalClassificationConcurrentReaders`, `TestTerminalReplayStableAcrossRuns` |
 | dynamic spawn, dedup-once, cycle/dangling/cap rejection | `pkg/engine/engine_spawn_test.go` |
 | cross-run isolation, concurrent reader consistency | `TestMultiRunIsolation`, `TestObserverConsistentView` |

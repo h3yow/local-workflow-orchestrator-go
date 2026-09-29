@@ -12,12 +12,13 @@ import (
 //
 // Dedup scope and guarantee:
 //
-//   - the key is unique within (run, node); the same key on later attempts,
-//     after a crash-and-resume replay, or from racing goroutines, takes effect
-//     exactly once;
+//   - the key is unique within a RUN, across every node in that run; the same
+//     key committed by a different node, on a later attempt, after a
+//     crash-and-resume replay, or from racing goroutines, takes effect exactly
+//     once and every later registrant receives the single surviving record;
 //
-//   - different runs (and different nodes within a run) never collide, even
-//     when they happen to use the same key string;
+//   - different runs never collide, even when they happen to use the same key
+//     string (and even from identically named nodes);
 //
 //   - Commit is durable before it returns committed=true, so callers can use
 //     the result as an effect gate:
@@ -30,9 +31,10 @@ import (
 //     // rec is the single surviving record, queryable and replayable later.
 type ActionRecorder interface {
 	// Commit records the action identified by key with an optional replay
-	// payload. It returns the stored record and true on the first commit of
-	// the key; if the key was already committed it returns the pre-existing
-	// record and false without mutating anything.
+	// payload. Within the run it returns the stored record and true on the
+	// first commit of the key (regardless of which node commits it); if the
+	// key was already committed in this run it returns the pre-existing record
+	// and false without mutating anything.
 	Commit(ctx context.Context, key, value string) (*model.ActionRecord, bool, error)
 }
 

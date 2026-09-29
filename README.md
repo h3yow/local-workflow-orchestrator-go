@@ -72,12 +72,15 @@ rec, _ := eng2.Wait(context.Background(), runID)
   readers derive the same state/reason pair.
 - **Business actions (exactly-once per run)**: tasks register externally
   visible effects through `in.Actions.Commit(ctx, businessKey, payload)`.
-  Within a `(run, node)` the key takes effect exactly once: the first durable
-  commit returns `committed=true` (the signal to perform the effect); retries,
-  crash-recovered replays and racing goroutines get the original record with
-  `committed=false`. The committed set survives restarts, is queryable via
+  Within a **run** the key takes effect exactly once, regardless of which node
+  commits it: the first durable commit returns `committed=true` (the signal to
+  perform the effect); a different node reusing the same key, retries,
+  crash-recovered replays and racing goroutines all get the original
+  (first-winner) record with `committed=false` and add no second record. The
+  committed set survives restarts, is queryable via
   `eng.Actions(runID)` / `RunRecord.Actions`, replays in deterministic order,
-  and never interacts across runs.
+  and never interacts across runs (identical keys in different runs are
+  independent).
 - **Failure codes**: `attempts_exhausted`, `timeout`, `permanent`,
   `invalid_spawn`, `upstream_failed`, `recovered_running` (the last one is an
   intermediate annotation only and never appears on a terminal node).
@@ -127,6 +130,15 @@ storage layout and verification procedure.
 
 ```bash
 go test ./... -race -count=3
+```
+
+To focus on business-action uniqueness (cross-node reuse within a run,
+exactly-once side effects, and single-record survival across crash/recovery
+replay):
+
+```bash
+go test ./pkg/store/  -run 'TestAction' -race -v
+go test ./pkg/engine/ -run 'TestAction' -race -v
 ```
 
 Test logs print the input specification and the state-transition rationale

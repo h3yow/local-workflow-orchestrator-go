@@ -175,6 +175,182 @@ func TestActionScopedPerRun(t *testing.T) {
 	}
 }
 
+// TestActionSameKeyTwoNodesOneEffect reproduces the real-task failure: two
+// DIFFERENT nodes in the same run register the same business key. Only the
+// first registrant performs the external side effect; the second observes the
+// already-stored record (committed=false) and must not add a second record.
+func TestActionSameKeyTwoNodesOneEffect(t *testing.T) {
+	st := newMemStore()
+	// Two independent (no edge between them) nodes, so the scheduler may run
+	// them concurrently.
+	s := runSpec(nn("node-a", 1), nn("node-b", 1))
+	logSpec(t, "[ACTION]", s)
+
+	var effects int32
+	var winnersMu sync.Mutex
+	winners := map[string]bool{}
+	reg := ResolverFunc(func(id string) (Task, bool) {
+		return func(ctx context.Context, in TaskInput) (*ExecResult, error) {
+			rec, committed, err := in.Actions.Commit(ctx, "shared-key", "payload-"+in.NodeID)
+			if err != nil {
+				return nil, err
+			}
+			if committed {
+				atomic.AddInt32(&effects, 1)
+				winnersMu.Lock()
+				winners[in.NodeID] = true
+				winnersMu.Unlock()
+				if rec.NodeID != in.NodeID {
+					t.Errorf("winner record NodeID=%s want %s", rec.NodeID, in.NodeID)
+				}
+			} else {
+				// Loser must see the winner's record verbatim, not its own.
+				if rec.Key != "shared-key" || rec.NodeID == "" {
+					t.Errorf("loser got unexpected record %+v", rec)
+				}
+				if rec.Value == "payload-"+in.NodeID {
+					t.Errorf("loser received its own payload, not the winner's: %+v", rec)
+				}
+			}
+			return &ExecResult{}, nil
+		}, true
+	})
+	eng := New(st, reg, Config{})
+	defer eng.Shutdown(context.Background())
+	id, err := eng.Submit(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := eng.Wait(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logTransitions(t, "[ACTION]", rec)
+
+	if got := atomic.LoadInt32(&effects); got != 1 {
+		t.Fatalf("external side effect ran %d times across two nodes, want 1", got)
+	}
+	if len(winners) != 1 {
+		t.Fatalf("committing nodes=%v want exactly one winner", winners)
+	}
+	if rec.Actions == nil || len(rec.Actions.Actions) != 1 {
+		t.Fatalf("final action set=%+v want exactly 1 record", rec.Actions)
+	}
+	ar := rec.Actions.Actions[0]
+	if ar.Key != "shared-key" {
+		t.Fatalf("surviving key=%q", ar.Key)
+	}
+	// Re-reads are stable and identical.
+	log2, err := eng.Actions(context.Background(), id)
+	if err != nil || len(log2.Actions) != 1 || log2.Actions[0] != ar {
+		t.Fatalf("re-read action set=%+v err=%v", log2, err)
+	}
+}
+
+// TestActionSameKeyAcrossNodesAndRestart combines cross-node reuse with crash
+// recovery: node A durably registers the key and is killed before its result
+// is processed; after restart A is replayed and a downstream node B registers
+// the same key. The external effect happens exactly once, only one record
+// survives (A's), and the set is identical for every reader after recovery.
+func TestActionSameKeyAcrossNodesAndRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a is interrupted mid-run; b (depends on a) only executes after recovery.
+	s := runSpec(nn("a", 1), nn("b", 1, "a"))
+	logSpec(t, "[ACTION]", s)
+
+	var effects int32
+	core := func(blockFirstAttempt bool, markCommitted chan<- struct{}) func(context.Context, TaskInput) (*ExecResult, bool, error) {
+		return func(ctx context.Context, in TaskInput) (*ExecResult, bool, error) {
+			rec, committed, err := in.Actions.Commit(ctx, "order-99", "payload-"+in.NodeID)
+			if err != nil {
+				return nil, false, err
+			}
+			if committed {
+				atomic.AddInt32(&effects, 1)
+				if markCommitted != nil {
+					close(markCommitted)
+				}
+			} else if rec.NodeID != "a" || rec.Value != "payload-a" {
+				t.Errorf("node %s saw unexpected winner record %+v", in.NodeID, rec)
+			}
+			if blockFirstAttempt && in.NodeID == "a" && in.Attempt == 0 {
+				// Killed with the action durable but the attempt unresolved.
+				<-ctx.Done()
+			}
+			return &ExecResult{Value: "ok-" + in.NodeID}, committed, nil
+		}
+	}
+
+	committed := make(chan struct{})
+	resolver := func(block bool, mark chan struct{}) Resolver {
+		return ResolverFunc(func(id string) (Task, bool) {
+			return func(ctx context.Context, in TaskInput) (*ExecResult, error) {
+				r, _, err := core(block, mark)(ctx, in)
+				return r, err
+			}, true
+		})
+	}
+
+	eng1 := New(st, resolver(true, committed), Config{})
+	runID, err := eng1.Submit(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-committed
+	// The single record is durable while A is still running.
+	acts, err := st.LoadActions(context.Background(), runID)
+	if err != nil || len(acts.Actions) != 1 || acts.Actions[0].NodeID != "a" {
+		t.Fatalf("mid-run durable action set err=%v %+v", err, acts)
+	}
+	if err := eng1.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart: A replays (committed=false), then B runs and reuses the key.
+	eng2 := New(st, resolver(false, nil), Config{})
+	defer eng2.Shutdown(context.Background())
+	if err := eng2.Resume(context.Background(), runID); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := eng2.Wait(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logTransitions(t, "[ACTION]", rec)
+
+	if got := atomic.LoadInt32(&effects); got != 1 {
+		t.Fatalf("external effect ran %d times across replay and downstream node, want 1", got)
+	}
+	if rec.Status.Nodes["a"].State != model.StateSucceeded || rec.Status.Nodes["b"].State != model.StateSucceeded {
+		t.Fatalf("final states: a=%s b=%s", rec.Status.Nodes["a"].State, rec.Status.Nodes["b"].State)
+	}
+	if rec.Actions == nil || len(rec.Actions.Actions) != 1 {
+		t.Fatalf("final action set=%+v want 1 record", rec.Actions)
+	}
+	ar := rec.Actions.Actions[0]
+	if ar.Key != "order-99" || ar.NodeID != "a" || ar.Attempt != 0 || ar.Value != "payload-a" {
+		t.Fatalf("surviving record drifted across restart: %+v", ar)
+	}
+	// A third process reopening the store sees the identical set.
+	st3, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, committed2, err := st3.CommitAction(context.Background(), &model.ActionRecord{
+		RunID: runID, NodeID: "c", Key: "order-99", Value: "payload-c"})
+	if err != nil || committed2 || again.Seq != ar.Seq || again.NodeID != "a" {
+		t.Fatalf("reopen replay: rec=%+v committed=%v err=%v", again, committed2, err)
+	}
+	log3, err := st3.LoadActions(context.Background(), runID)
+	if err != nil || len(log3.Actions) != 1 || log3.Actions[0] != ar {
+		t.Fatalf("reopened action set=%+v err=%v", log3, err)
+	}
+}
+
 // TestActionConcurrentSameKey: many goroutines commit the same key at once;
 // exactly one wins, the set is one record and everyone saw the same winner.
 func TestActionConcurrentSameKey(t *testing.T) {
